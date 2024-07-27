@@ -10,8 +10,10 @@ Mappings:
   RegionMap:
     us-east-1:
       AmazonLinux2023: ami-0b72821e2f351e396
+      EcsOptimizedAmazonLinux2023: ami-025a8beccff4de554
     ap-northeast-2:
       AmazonLinux2023: ami-04ea5b2d3c8ceccf8
+      EcsOptimizedAmazonLinux2023: ami-0856df28f23817b2f
   ResourceMap:
     Vpc:
       Name : skills-vpc
@@ -509,7 +511,7 @@ Resources:
                 - CONTAINER_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_VERSION"
                 - |
                   jq -n --arg FAMILY $FAMILY --arg EXECUTION_ROLE_ARN $EXECUTION_ROLE_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_IMAGE $CONTAINER_IMAGE --arg AWS_DEFAULT_REGION $AWS_DEFAULT_REGION \
-                    '{ "family":$FAMILY, "executionRoleArn":$EXECUTION_ROLE_ARN, "networkMode":"awsvpc", "cpu":"256", "memory":"512", "containerDefinitions":[{"logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/skills-td","awslogs-region":$AWS_DEFAULT_REGION,"awslogs-stream-prefix":"ecs"}},"name":$CONTAINER_NAME,"image":$CONTAINER_IMAGE,"portMappings":[{"containerPort":80,"hostPort":80,"protocol":"tcp"}]}] }' \
+                    '{ "family":$FAMILY, "executionRoleArn":$EXECUTION_ROLE_ARN, "networkMode":"awsvpc", "cpu":"256", "memory":"512", "containerDefinitions":[{"healthCheck":{"command":["CMD-SHELL","curl -f http://localhost/health || exit 1"],"interval":10,"timeout":5,"retries":3,"startPeriod": 0},"logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/skills-td","awslogs-region":$AWS_DEFAULT_REGION,"awslogs-stream-prefix":"ecs"}},"name":$CONTAINER_NAME,"image":$CONTAINER_IMAGE,"portMappings":[{"containerPort":80,"hostPort":80,"protocol":"tcp"}]}] }' \
                     > task-definition.json
                 - TASK_DEFINITION_JSON=$(aws ecs register-task-definition --cli-input-json file://task-definition.json)
                 - TASK_DEFINITION_ARN=$(echo $TASK_DEFINITION_JSON | jq -r '.taskDefinition .taskDefinitionArn')
@@ -589,7 +591,7 @@ Resources:
     Properties:
       InstanceProfileName: EcsAutoScalingGroupProfile
       Roles: 
-        - !Ref BastionEc2IamRole
+        - !Ref EcsAutoScalingGroupIamRole
   EcsCluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -605,7 +607,7 @@ Resources:
     DependsOn: EcsCluster
     Properties:
       LaunchTemplateData:
-        ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AmazonLinux2023]
+        ImageId: !FindInMap [RegionMap, !Ref AWS::Region, EcsOptimizedAmazonLinux2023]
         TagSpecifications:
           - ResourceType: instance
             Tags: 
@@ -624,24 +626,24 @@ Resources:
             !Sub |
               #!/bin/bash -xe
               exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-              dnf update -y
-              dnf install docker -y
-              systemctl start docker
-              systemctl enable docker
-              usermod -aG docker ec2-user
-              newgrp docker
-              curl -O https://s3.${AWS::Region}.amazonaws.com/amazon-ecs-agent-${AWS::Region}/amazon-ecs-init-latest.x86_64.rpm
-              yum localinstall -y amazon-ecs-init-latest.x86_64.rpm
-              sed -i "s/After=docker.service/After=cloud-final.service/g" /lib/systemd/system/ecs.service
+              # dnf update -y
+              # dnf install docker -y
+              # systemctl start docker
+              # systemctl enable docker
+              # usermod -aG docker ec2-user
+              # newgrp docker
+              # curl -O https://s3.${AWS::Region}.amazonaws.com/amazon-ecs-agent-${AWS::Region}/amazon-ecs-init-latest.x86_64.rpm
+              # yum localinstall -y amazon-ecs-init-latest.x86_64.rpm
+              # sed -i "s/After=docker.service/After=cloud-final.service/g" /lib/systemd/system/ecs.service
               mkdir -p /etc/ecs
               echo "ECS_CLUSTER=skills-cluster" > /etc/ecs/ecs.config
-              systemctl enable --now --no-block ecs.service
+              # systemctl enable --now --no-block ecs.service
   EcsAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: EcsCluster
     Properties:
       MinSize: 1
-      MaxSize: 10
+      MaxSize: 6
       DesiredCapacity: 3
       Cooldown: 0
       MixedInstancesPolicy:
@@ -678,7 +680,7 @@ Resources:
         ManagedScaling:
           InstanceWarmupPeriod: 60
           Status: ENABLED
-          # TargetCapacity: 100
+          TargetCapacity: 50
         ManagedTerminationProtection: DISABLED
   ClusterCPAssociation:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
@@ -703,7 +705,7 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
   EcsTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     DependsOn: BastionEc2
@@ -777,7 +779,10 @@ Resources:
         - Field: instanceId
           Type: spread
       EnableECSManagedTags: true
-
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref EcsCapacityProvider
+          Base: 0
+          Weight: 1
   CodeDeployApplication:
     Type: AWS::CodeDeploy::Application
     Properties:
