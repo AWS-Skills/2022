@@ -483,6 +483,7 @@ Resources:
               AWS_DEFAULT_REGION: ${AWS::Region}
               AWS_ACCOUNT_ID: ${AWS::AccountId}
               IMAGE_REPO_NAME: ${Ecr}
+              CAPACITY_PROVIDER: ${EcsCapacityProvider}
           phases:
             pre_build:
               commands:
@@ -516,8 +517,8 @@ Resources:
                 - TASK_DEFINITION_JSON=$(aws ecs register-task-definition --cli-input-json file://task-definition.json)
                 - TASK_DEFINITION_ARN=$(echo $TASK_DEFINITION_JSON | jq -r '.taskDefinition .taskDefinitionArn')
                 - >
-                  jq -n --arg TASK_DEFINITION_ARN $TASK_DEFINITION_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_PORT $CONTAINER_PORT \
-                  '{"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service", "Properties": {"TaskDefinition": $TASK_DEFINITION_ARN, "LoadBalancerInfo": {"ContainerName": $CONTAINER_NAME, "ContainerPort": $CONTAINER_PORT}}}}], "Hooks": []}' \
+                  jq -n --arg TASK_DEFINITION_ARN $TASK_DEFINITION_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_PORT $CONTAINER_PORT --arg CAPACITY_PROVIDER $CAPACITY_PROVIDER \
+                  '{"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service", "Properties": {"TaskDefinition": $TASK_DEFINITION_ARN, "LoadBalancerInfo": {"ContainerName": $CONTAINER_NAME, "ContainerPort": $CONTAINER_PORT}, "CapacityProviderStrategy": [{"Base":0,"CapacityProvider":$CAPACITY_PROVIDER,"Weight":1}]}}}]}' \
                   > appspec.json
           artifacts:
             files:
@@ -680,7 +681,7 @@ Resources:
         ManagedScaling:
           InstanceWarmupPeriod: 60
           Status: ENABLED
-          TargetCapacity: 50
+          TargetCapacity: 100
         ManagedTerminationProtection: DISABLED
   ClusterCPAssociation:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
