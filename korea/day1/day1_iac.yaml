@@ -260,8 +260,6 @@ Resources:
       - EksCluster
       - MatchEcr
       - StressEcr
-      - AWSLoadBalancerControllerIAMPolicy
-      - AmazonEKSClusterAutoscalerPolicy
     # CreationPolicy:
       # ResourceSignal:
       #   Count: '1'                
