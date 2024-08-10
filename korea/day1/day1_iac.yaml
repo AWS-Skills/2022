@@ -253,27 +253,15 @@ Resources:
     Properties:
       EmptyOnDelete: True
       RepositoryName: stress-ecr
-  CodeCommitSourceS3Bucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: RetainExceptOnCreate
-  CodeCommit:
-    Type: AWS::CodeCommit::Repository
-    # DependsOn: BastionEc2
-    Properties:
-      # Code: 
-      #   BranchName: main
-      #   S3: 
-      #     Bucket: !Ref CodeCommitSourceS3Bucket
-      #     Key: src.zip
-      RepositoryName: skills-code
 
   BastionEc2:
     Type: AWS::EC2::Instance
     DependsOn: 
       - EksCluster
-      - CodeCommitSourceS3Bucket
       - MatchEcr
       - StressEcr
+      - AWSLoadBalancerControllerIAMPolicy
+      - AmazonEKSClusterAutoscalerPolicy
     # CreationPolicy:
       # ResourceSignal:
       #   Count: '1'                
@@ -296,7 +284,8 @@ Resources:
         # sudo tail -f /var/log/cloud-init-output.log
         Fn::Base64: 
           !Sub |
-            #!/bin/bash -x
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
             dnf update -y
             dnf install docker -y
             systemctl start docker
@@ -425,17 +414,17 @@ Resources:
             docker build -t $STRESS_IMAGE_TAG /home/ec2-user/stress
             docker push $STRESS_IMAGE_TAG
 
-            sudo -u ec2-user bash << EOF
+            sudo -Eu ec2-user bash << 'EOF'
             cd /home/ec2-user
             mkdir -p /home/ec2-user/bin
             curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.30.0/2024-05-12/bin/linux/amd64/kubectl
             chmod +x kubectl
             cp kubectl /home/ec2-user/bin/kubectl
             export PATH=/home/ec2-user/bin:$PATH
-            echo 'export PATH=/home/ec2-user/bin:$PATH' >> ~/.bashrc
-            echo 'alias k=kubectl' >>~/.bashrc
-            echo 'complete -o default -F __start_kubectl k' >>~/.bashrc
-            echo 'source <(kubectl completion bash)' >>~/.bashrc
+            echo "export PATH=/home/ec2-user/bin:$PATH" >> ~/.bashrc
+            echo "alias k=kubectl" >>~/.bashrc
+            echo "complete -o default -F __start_kubectl k" >>~/.bashrc
+            echo "source <(kubectl completion bash)" >>~/.bashrc
             exec bash
             aws eks update-kubeconfig --region ${AWS::Region} --name ${EksCluster}
 
@@ -449,17 +438,14 @@ Resources:
             chmod 700 /home/ec2-user/get_helm.sh
             /home/ec2-user/get_helm.sh
 
-            curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.4.7/docs/install/iam_policy.json
-            aws iam create-policy \
-            --policy-name AWSLoadBalancerControllerIAMPolicy \
-            --policy-document file://iam_policy.json
+
             sleep 10
             eksctl create iamserviceaccount \
             --cluster=${EksCluster} \
             --namespace=kube-system \
             --name=aws-load-balancer-controller \
             --role-name AmazonEKSLoadBalancerControllerRole \
-            --attach-policy-arn=arn:aws:iam::${AWS::AccountId}:policy/AWSLoadBalancerControllerIAMPolicy \
+            --attach-policy-arn=${AWSLoadBalancerControllerIAMPolicy} \
             --approve --region ${AWS::Region}
             helm repo add eks https://aws.github.io/eks-charts
             helm repo update eks
@@ -469,65 +455,46 @@ Resources:
             --set serviceAccount.name=aws-load-balancer-controller \
             --set region=${AWS::Region} \
             --set vpcId=${Vpc}
+            kubectl rollout status -n kube-system deploy aws-load-balancer-controller
+            sleep 10
 
             mkdir -p ~/environment/cluster-autoscaler
-            cat <<EoF > ~/environment/cluster-autoscaler/cluster-autoscaler-policy.json
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "VisualEditor0",
-                        "Effect": "Allow",
-                        "Action": [
-                            "autoscaling:SetDesiredCapacity",
-                            "autoscaling:TerminateInstanceInAutoScalingGroup"
-                        ],
-                        "Resource": "*",
-                        "Condition": {
-                            "StringEquals": {
-                                "aws:ResourceTag/k8s.io/cluster-autoscaler/${EksCluster}": "owned"
-                            }
-                        }
-                    },
-                    {
-                        "Sid": "VisualEditor1",
-                        "Effect": "Allow",
-                        "Action": [
-                            "autoscaling:DescribeAutoScalingInstances",
-                            "autoscaling:DescribeAutoScalingGroups",
-                            "ec2:DescribeLaunchTemplateVersions",
-                            "autoscaling:DescribeTags",
-                            "autoscaling:DescribeLaunchConfigurations",
-                            "ec2:DescribeInstanceTypes"
-                        ],
-                        "Resource": "*"
-                    }
-                ]
-            }
-            EoF
-            aws iam create-policy   \
-              --policy-name AmazonEKSClusterAutoscalerPolicy \
-              --policy-document file://~/environment/cluster-autoscaler/cluster-autoscaler-policy.json
             eksctl create iamserviceaccount \
                 --name cluster-autoscaler \
                 --namespace kube-system \
                 --cluster ${EksCluster} \
-                --attach-policy-arn "arn:aws:iam::${AWS::AccountId}:policy/AmazonEKSClusterAutoscalerPolicy" \
+                --attach-policy-arn "${AmazonEKSClusterAutoscalerPolicy}" \
                 --approve \
                 --override-existing-serviceaccounts
             kubectl -n kube-system describe sa cluster-autoscaler
             curl -o ~/environment/cluster-autoscaler/cluster-autoscaler-autodiscover.yaml https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
 
-            sed -i 's/<YOUR CLUSTER NAME>/${EksCluster}/g' ~/environment/cluster-autoscaler/cluster-autoscaler-autodiscover.yaml
+            sed -i "s/<YOUR CLUSTER NAME>/${EksCluster}/g" ~/environment/cluster-autoscaler/cluster-autoscaler-autodiscover.yaml
             kubectl apply -f ~/environment/cluster-autoscaler/cluster-autoscaler-autodiscover.yaml
             kubectl -n kube-system annotate deployment.apps/cluster-autoscaler cluster-autoscaler.kubernetes.io/safe-to-evict="false"
-            export K8S_VERSION=$(kubectl version --short | grep 'Server Version:' | sed 's/[^0-9.]*\([0-9.]*\).*/\1/' | cut -d. -f1,2)
-            export AUTOSCALER_VERSION=$(curl -s "https://api.github.com/repos/kubernetes/autoscaler/releases" | grep '"tag_name":' | sed -s 's/.*-\([0-9][0-9\.]*\).*/\1/' | grep -m1 $K8S_VERSION)
+            K8S_VERSION=$(kubectl version | grep "Server Version:" | sed "s/[^0-9.]*\([0-9.]*\).*/\1/" | cut -d. -f1,2)
+            AUTOSCALER_VERSION=$(curl -s "https://api.github.com/repos/kubernetes/autoscaler/releases" | grep "\"tag_name\":" | sed -s "s/.*-\([0-9][0-9\.]*\).*/\1/" | grep -m1 $K8S_VERSION)
             echo $AUTOSCALER_VERSION
             kubectl -n kube-system \
             set image deployment.apps/cluster-autoscaler \
             cluster-autoscaler="registry.k8s.io/autoscaling/cluster-autoscaler:v$AUTOSCALER_VERSION"
+            kubectl rollout status -n kube-system deploy cluster-autoscaler
+            sleep 10
+
             kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+            kubectl create deployment php-apache --image=us.gcr.io/k8s-artifacts-prod/hpa-example
+            kubectl set resources deploy php-apache --requests=cpu=200m
+            kubectl expose deploy php-apache --port 80
+            kubectl autoscale deployment php-apache --cpu-percent=60 --min=1 --max=10
+            
+            git clone https://codeberg.org/hjacobs/kube-ops-view.git
+            cd kube-ops-view/
+            kubectl apply -k deploy
+            kubectl patch svc kube-ops-view -p "{\"spec\": {\"type\": \"LoadBalancer\"}}"
+
+            kubectl run -i load-generator --image=busybox -- /bin/sh -c "while true; do wget -q -O - http://php-apache; done"
+
             EOF
 
             # /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BastionEc2 --region ${AWS::Region}
@@ -566,6 +533,73 @@ Resources:
       InstanceProfileName: Ec2AdminProfile
       Roles: 
         - !Ref BastionEc2IamRole
+
+  AWSLoadBalancerControllerIAMPolicy:
+    # https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.4.7/docs/install/iam_policy.json
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "iam:CreateServiceLinkedRole"
+            Resource: "*"
+            Condition:
+              StringEquals: 
+                "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
+          - Effect: "Allow"
+            Action: 
+              - "ec2:*"
+              - "elasticloadbalancing:*"
+            Resource: "*"
+          - Effect: "Allow"
+            Action: 
+              - "cognito-idp:DescribeUserPoolClient"
+              - "acm:ListCertificates"
+              - "acm:DescribeCertificate"
+              - "iam:ListServerCertificates"
+              - "iam:GetServerCertificate"
+              - "waf-regional:GetWebACL"
+              - "waf-regional:GetWebACLForResource"
+              - "waf-regional:AssociateWebACL"
+              - "waf-regional:DisassociateWebACL"
+              - "wafv2:GetWebACL"
+              - "wafv2:GetWebACLForResource"
+              - "wafv2:AssociateWebACL"
+              - "wafv2:DisassociateWebACL"
+              - "shield:GetSubscriptionState"
+              - "shield:DescribeProtection"
+              - "shield:CreateProtection"
+              - "shield:DeleteProtection"
+            Resource: "*"
+      ManagedPolicyName: AWSLoadBalancerControllerIAMPolicy
+  AmazonEKSClusterAutoscalerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "VisualEditor0"
+            Effect: "Allow"
+            Action:
+              - "autoscaling:SetDesiredCapacity"
+              - "autoscaling:TerminateInstanceInAutoScalingGroup"
+            Resource: "*"
+            Condition: 
+              StringEquals:
+                "aws:ResourceTag/k8s.io/cluster-autoscaler/${EksCluster}": "owned"
+          - Sid: "VisualEditor1"
+            Effect: "Allow"
+            Action:
+              - "autoscaling:DescribeAutoScalingInstances"
+              - "autoscaling:DescribeAutoScalingGroups"
+              - "ec2:DescribeLaunchTemplateVersions"
+              - "autoscaling:DescribeTags"
+              - "autoscaling:DescribeLaunchConfigurations"
+              - "ec2:DescribeInstanceTypes"
+            Resource: "*"
+      ManagedPolicyName: AmazonEKSClusterAutoscalerPolicy
 
   EksCluster:
     Type: AWS::EKS::Cluster
@@ -702,10 +736,12 @@ Resources:
       GroupDescription: "Security Group for EKS Cluster Node SSH Connection"
       GroupName: eks-node-sg
       SecurityGroupIngress: 
-        - SourceSecurityGroupId: !Ref BastionEc2SecurityGroup
-          FromPort: 22
-          IpProtocol: tcp
-          ToPort: 22
+        # - SourceSecurityGroupId: !Ref BastionEc2SecurityGroup
+        #   FromPort: 22
+        #   IpProtocol: tcp
+        #   ToPort: 22
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
       VpcId: !Ref Vpc
       Tags:
         - Key: Name
