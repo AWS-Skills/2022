@@ -27,12 +27,6 @@ Mappings:
     BastionEc2:
       Name: skills-bastion2
       InstanceType: t3.small #c5.large
-    CodePipeline:
-      Name: skills-pipeline
-      Source: skills-commit
-      Build: skills-build
-      DeployApplication: skills-app
-      DeploymentGroup: skills-dg
 
 Resources:
   KeyPair:
