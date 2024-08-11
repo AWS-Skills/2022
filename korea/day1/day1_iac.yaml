@@ -338,12 +338,12 @@ Resources:
             RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o match match.go
             FROM alpine
             WORKDIR /app
-            RUN apk --no-cache add ca-certificates && apk --no-cache upgrade
+            RUN apk --no-cache add ca-certificates curl && apk --no-cache upgrade
             COPY --from=build /source/match ./
             RUN chmod +x ./match
-            RUN adduser -D appuser
-            RUN chown appuser:appuser ./match
-            USER appuser
+            RUN adduser -D match
+            RUN chown match:match ./match
+            USER match
             ENTRYPOINT ["./match"]' > /home/ec2-user/match/Dockerfile
             aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
             MATCH_IMAGE_TAG=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MatchEcr}:latest
@@ -400,18 +400,18 @@ Resources:
             RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o stress stress.go
             FROM alpine
             WORKDIR /app
-            RUN apk --no-cache add ca-certificates && apk --no-cache upgrade
+            RUN apk --no-cache add ca-certificates curl && apk --no-cache upgrade
             COPY --from=build /source/stress ./
             RUN chmod +x ./stress
-            RUN adduser -D appuser
-            RUN chown appuser:appuser ./stress
-            USER appuser
+            RUN adduser -D stress
+            RUN chown stress:stress ./stress
+            USER stress
             ENTRYPOINT ["./stress"]' > /home/ec2-user/stress/Dockerfile
             aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
             STRESS_IMAGE_TAG=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StressEcr}:latest
             docker build -t $STRESS_IMAGE_TAG /home/ec2-user/stress
             docker push $STRESS_IMAGE_TAG
-
+            
             sudo -Eu ec2-user bash << 'EOF'
             cd /home/ec2-user
             mkdir -p /home/ec2-user/bin
@@ -435,7 +435,6 @@ Resources:
             curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > /home/ec2-user/get_helm.sh
             chmod 700 /home/ec2-user/get_helm.sh
             /home/ec2-user/get_helm.sh
-
 
             sleep 10
             eksctl create iamserviceaccount \
@@ -481,19 +480,31 @@ Resources:
 
             kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-            kubectl create deployment php-apache --image=us.gcr.io/k8s-artifacts-prod/hpa-example
-            kubectl set resources deploy php-apache --requests=cpu=200m
-            kubectl expose deploy php-apache --port 80
-            kubectl autoscale deployment php-apache --cpu-percent=60 --min=1 --max=10
-            
-            git clone https://codeberg.org/hjacobs/kube-ops-view.git
-            cd kube-ops-view/
-            kubectl apply -k deploy
-            kubectl patch svc kube-ops-view -p "{\"spec\": {\"type\": \"LoadBalancer\"}}"
+            sleep 20
 
-            kubectl run -i load-generator --image=busybox -- /bin/sh -c "while true; do wget -q -O - http://php-apache; done"
+            # AwsLoadbalancerController (kube-system)
+            kubectl patch -n kube-system deployment aws-load-balancer-controller -p '{"spec": {"template": {"spec": {"nodeSelector": {"skills/dedicated": "addon"}}}}}'
+            kubectl scale -n kube-system deployment aws-load-balancer-controller --replicas=0
+            sleep 10
+            kubectl scale -n kube-system deployment aws-load-balancer-controller --replicas=2
 
-            EOF
+            # ClusterAutoscaler (kube-system)
+            kubectl patch -n kube-system deployment cluster-autoscaler -p '{"spec": {"template": {"spec": {"nodeSelector": {"skills/dedicated": "addon"}}}}}'
+            kubectl scale -n kube-system deployment cluster-autoscaler --replicas=0
+            sleep 10
+            kubectl scale -n kube-system deployment cluster-autoscaler --replicas=1
+
+            # CoreDNS (kube-system)
+            kubectl patch -n kube-system deployment coredns -p '{"spec": {"template": {"spec": {"nodeSelector": {"skills/dedicated": "addon"}}}}}'
+            kubectl scale -n kube-system deployment coredns --replicas=0
+            sleep 10
+            kubectl scale -n kube-system deployment coredns --replicas=2
+
+            # MetricsServer (kube-system)
+            kubectl patch -n kube-system deployment metrics-server -p '{"spec": {"template": {"spec": {"nodeSelector": {"skills/dedicated": "addon"}}}}}'
+            kubectl scale -n kube-system deployment metrics-server --replicas=0
+            sleep 10
+            kubectl scale -n kube-system deployment metrics-server --replicas=1
 
             # /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BastionEc2 --region ${AWS::Region}
   BastionEc2SecurityGroup:
@@ -788,7 +799,116 @@ Resources:
       PrincipalArn: !GetAtt BastionEc2IamRole.Arn
       Type: STANDARD
 
-
-
+  # NodegroupCloudWatchDashboard:
+  #   Type: AWS::CloudWatch::Dashboard
+  #   Properties:
+  #     DashboardName: worker
+  #     DashboardBody: 
+  #       !Sub |
+  #         {
+  #           "widgets": [
+  #             {
+  #               "height": 10,
+  #               "width": 10,
+  #               "y": 0,
+  #               "x": 0,
+  #               "type": "metric",
+  #               "properties": {
+  #                 "metrics": [
+  #                   [ "AWS/ApplicationELB", "CPUUtilization", "AutoScalingGroupName", "${AppNodeGroup}", { "region": "${AWS::Region}" } ]
+  #                 ],
+  #                 "view": "timeSeries",
+  #                 "stacked": false,
+  #                 "region": "${AWS::Region}",
+  #                 "period": 60,
+  #                 "title": "WORKER CPU",
+  #                 "start": "-PT3H"
+  #               }
+  #             },
+  #             {
+  #               "height": 10,
+  #               "width": 10,
+  #               "y": 0,
+  #               "x": 10,
+  #               "type": "metric",
+  #               "properties": {
+  #                 "metrics": [
+  #                     [ "AWS/ApplicationELB", "NetworkOut", "AutoScalingGroupName", "${AppNodeGroup}", { "region": "${AWS::Region}" } ],
+  #                     [ "AWS/ApplicationELB", "NetworkIn", "AutoScalingGroupName", "${AppNodeGroup}", { "region": "${AWS::Region}" } ]
+  #                 ],
+  #                 "view": "timeSeries",
+  #                 "stacked": false,
+  #                 "region": "${AWS::Region}",
+  #                 "stat": "Sum",
+  #                 "period": 60,
+  #                 "title": "WORKER NETWORK"
+  #               }
+  #             }
+  #           ]
+  #         }
+  # AlbCloudWatchDashboard:
+  #   Type: AWS::CloudWatch::Dashboard
+  #   Properties:
+  #     DashboardName: stress
+  #     DashboardBody: 
+  #       !Sub 
+  #         - |
+  #           {
+  #             "widgets": [
+  #               {
+  #                 "height": 10,
+  #                 "width": 10,
+  #                 "y": 0,
+  #                 "x": 0,
+  #                 "type": "metric",
+  #                 "properties": {
+  #                   "metrics": [
+  #                     [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${AlbFullName}", { "region": "${AWS::Region}" } ]
+  #                   ],
+  #                   "view": "timeSeries",
+  #                   "stacked": false,
+  #                   "region": "${AWS::Region}",
+  #                   "period": 60,
+  #                   "title": "STRESS REQ COUNT",
+  #                   "start": "-PT3H"
+  #                 }
+  #               },
+  #               {
+  #                 "height": 10,
+  #                 "width": 10,
+  #                 "y": 0,
+  #                 "x": 10,
+  #                 "type": "metric",
+  #                 "properties": {
+  #                     "metrics": [
+  #                         [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${AlbFullName}" ]
+  #                     ],
+  #                     "view": "timeSeries",
+  #                     "stacked": false,
+  #                     "region": "${AWS::Region}",
+  #                     "period": 60,
+  #                     "title": "STRESS RES TIME"
+  #                 }
+  #               },
+  #               {
+  #                 "height": 10,
+  #                 "width": 10,
+  #                 "y": 10,
+  #                 "x": 0,
+  #                 "type": "metric",
+  #                 "properties": {
+  #                   "view": "timeSeries",
+  #                   "stacked": false,
+  #                   "metrics": [
+  #                       [ "AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${AlbFullName}", { "region": "${AWS::Region}" } ],
+  #                   ],
+  #                   "period": 60,
+  #                   "region": "${AWS::Region}",
+  #                   "title": "STRESS 5xx"
+  #                 }
+  #               }
+  #             ]
+  #           }
+  #         - AlbFullName: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
 
 
